@@ -8,12 +8,21 @@ Type=notify
 ExecStart=/usr/local/bin/etcd \
  --name ${name} \
  --data-dir /var/lib/etcd \
- --initial-advertise-peer-urls http://${ip}:2380 \
- --listen-peer-urls http://${ip}:2380 \
- --listen-client-urls http://${ip}:2379,http://127.0.0.1:2379 \
- --advertise-client-urls http://${ip}:2379 \
- --initial-cluster-token etcd-cluster-1 \
- --initial-cluster etcd1=http://192.168.50.181:2380,etcd2=http://192.168.50.182:2380,etcd3=http://192.168.50.183:2380 \
+ --logger=zap \
+ --client-cert-auth \
+ --trusted-ca-file=/etc/etcd/certs/ca.pem \
+ --cert-file=/etc/etcd/certs/cluster.pem \
+ --key-file=/etc/etcd/certs/cluster-key.pem \
+ --peer-client-cert-auth \
+ --peer-trusted-ca-file=/etc/etcd/certs/ca.pem \
+ --peer-cert-file=/etc/etcd/certs/cluster.pem \
+ --peer-key-file=/etc/etcd/certs/cluster-key.pem \
+ --initial-advertise-peer-urls https://${ip}:2380 \
+ --listen-peer-urls https://${ip}:2380 \
+ --listen-client-urls https://${ip}:2379,https://127.0.0.1:2379 \
+ --advertise-client-urls https://${ip}:2379 \
+ --initial-cluster-token etcd-cluster \
+ --initial-cluster etcd1=https://192.168.50.181:2380,etcd2=https://192.168.50.182:2380,etcd3=https://192.168.50.183:2380 \
  --initial-cluster-state new \
  --heartbeat-interval 1000 \
  --election-timeout 5000

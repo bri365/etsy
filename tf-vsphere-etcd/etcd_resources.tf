@@ -45,11 +45,19 @@ resource "vsphere_virtual_machine" "etcd_nodes" {
     }
   }
 
+  # upload etcd binaries
   provisioner "file" {
     source = "etcd-v${var.etcd_version}-linux-amd64.tar.gz"
     destination = "/home/${var.guest_user}/etcd-v${var.etcd_version}-linux-amd64.tar.gz"
   }
 
+  # upload certificates
+  provisioner "file" {
+    source = "certs/etcd.tar.gz"
+    destination = "/home/${var.guest_user}/etcd.tar.gz"
+  }
+
+  # upload systemd service file
   provisioner "file" {
     content = templatefile("${path.module}/etcd.service.tmpl",
       { name = var.etcds[count.index], ip = self.guest_ip_addresses.0 })
@@ -58,18 +66,19 @@ resource "vsphere_virtual_machine" "etcd_nodes" {
 
   provisioner "remote-exec" {
     inline = [
+        "sudo sed -i 's/127.0.1.1 ubu20/127.0.1.1 ${var.etcds[count.index]}/' /etc/hosts",
+        "sudo groupadd --system etcd; sudo useradd -s /sbin/nologin --system -g etcd etcd",
+        "sudo mkdir -p /var/lib/etcd; sudo mkdir -p /etc/etcd/certs",
+        "sudo chown -R etcd:etcd /var/lib/etcd/",
+        "sudo chmod -R 700 /var/lib/etcd/",
         "cd /home/${var.guest_user}; tar xf etcd-v${var.etcd_version}-linux-amd64.tar.gz",
         "cd /home/${var.guest_user}/etcd-v${var.etcd_version}-linux-amd64; sudo mv etcd etcdctl /usr/local/bin",
-        "cd /home/${var.guest_user}; rm -rf etcd-v${var.etcd_version}*",
-        "sudo groupadd --system etcd; sudo useradd -s /sbin/nologin --system -g etcd etcd",
-        "sudo mkdir -p /var/lib/etcd/; sudo mkdir /etc/etcd",
-        "sudo chown -R etcd:etcd /var/lib/etcd/",
-        "cd /home/${var.guest_user}/; etcd --version; etcdctl version",
-        "cd /home/${var.guest_user}; cat etcd.service",
+        "cd /home/${var.guest_user}; sudo tar xf etcd.tar.gz -C /etc/etcd/certs",
+        "sudo chown -R etcd:etcd /etc/etcd/certs/",
         "sudo mv /home/${var.guest_user}/etcd.service /etc/systemd/system/etcd.service",
         "sudo systemctl daemon-reload; sudo systemctl enable etcd; sudo systemctl start etcd",
         "sleep 30; sudo systemctl status -l --no-pager etcd",
-        "sudo etcdctl member list",
+        "sudo etcdctl --cacert /etc/etcd/certs/ca.pem --cert /etc/etcd/certs/client.pem --key /etc/etcd/certs/client-key.pem member list",
       ]
   }
 
@@ -77,13 +86,8 @@ resource "vsphere_virtual_machine" "etcd_nodes" {
     user = var.guest_user
     # password = var.guest_password
     host = self.guest_ip_addresses.0
-    # host = format("%s.%d", var.vm_base_address, var.vm_starting_address + count.index)
     # private_key = file("perf_test_key.pem")
     agent = true
   }
 
-}
-
-output "ip" {
-  value = vsphere_virtual_machine.etcd_nodes.*.guest_ip_addresses
 }

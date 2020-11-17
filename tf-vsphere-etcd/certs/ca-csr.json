@@ -1,0 +1,17 @@
+{
+    "CN": "Demo etcd CA",
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "US",
+            "ST": "TX",
+            "L": "Austin",
+            "O": "Tantra Geek",
+            "OU": "DC"
+        }
+    ]
+}
+
