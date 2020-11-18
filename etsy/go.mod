@@ -23,6 +23,8 @@ require (
 	github.com/tmc/grpc-websocket-proxy v0.0.0-20200427203606-3cfed13b9966 // indirect
 	github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2 // indirect
 	go.etcd.io/bbolt v1.3.3 // indirect
+	// go.etcd.io/etcd v3.3.13+incompatible
+	go.etcd.io/etcd v0.5.0-alpha.5.0.20200819165624-17cef6e3e9d5
 	go.uber.org/zap v1.16.0 // indirect
 	golang.org/x/lint v0.0.0-20200302205851-738671d3881b // indirect
 	golang.org/x/net v0.0.0-20200707034311-ab3426394381 // indirect
@@ -32,6 +34,6 @@ require (
 	golang.org/x/tools v0.0.0-20200806022845-90696ccdc692 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/genproto v0.0.0-20191216164720-4f79533eabd1 // indirect
-	google.golang.org/grpc v1.22.0
+	google.golang.org/grpc v1.26.0
 	honnef.co/go/tools v0.0.1-2020.1.4 // indirect
 )
