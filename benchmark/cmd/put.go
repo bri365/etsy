@@ -77,14 +77,30 @@ func putFunc(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	var key []byte
+	var keys [][]byte
+	for i := 0; i < keySpaceSize; i++ {
+		data := make([]byte, keySize)
+		rand.Read(data)
+		keys = append(keys, data)
+	}
+
+	if seqKeys {
+		keys[0] = make([]byte, keySize)
+	} else {
+		k := keys[0]
+		binary.LittleEndian.PutUint64(k[keySize-8:keySize], 0)
+	}
+	// fmt.Printf("%v\n", keys[0])
+
+	value := make([]byte, valueSize)
+
 	requests := make(chan v3.Op, totalClients)
 	if putRate == 0 {
 		putRate = math.MaxInt32
 	}
 	limit := rate.NewLimiter(rate.Limit(putRate), 1)
 	clients := mustCreateClients(totalClients, totalConns)
-	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
-	println(keySize, k[0], valSize, v[0])
 
 	bar = pb.New(putTotal)
 	bar.Format("... !")
@@ -109,12 +125,13 @@ func putFunc(cmd *cobra.Command, args []string) {
 	go func() {
 		for i := 0; i < putTotal; i++ {
 			if seqKeys {
-				binary.PutVarint(k, int64(i%keySpaceSize))
+				key = keys[0]
+				binary.LittleEndian.PutUint64(key[keySize-8:keySize], uint64(i))
 			} else {
-				binary.PutVarint(k, int64(rand.Intn(keySpaceSize)))
+				key = keys[i%keySpaceSize]
 			}
-			// fmt.Printf("%d", k)
-			requests <- v3.OpPut(string(k), v)
+			// fmt.Printf("\n%v\n", binary.LittleEndian.Uint64(key[keySize-8:keySize]))
+			requests <- v3.OpPut(string(key), string(value))
 		}
 		close(requests)
 	}()
