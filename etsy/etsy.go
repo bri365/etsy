@@ -19,9 +19,9 @@ var (
 	endpoints      = []string{"192.168.50.181:2379", "192.168.50.182:2379", "192.168.50.183:2379"}
 
 	tlsInfo = transport.TLSInfo{
-		KeyFile:        "../tf-vsphere-etcd/certs/client-key.pem",
-		CertFile:       "../tf-vsphere-etcd/certs/client.pem",
-		TrustedCAFile:  "../tf-vsphere-etcd/certs/ca.pem",
+		KeyFile:        "../tf-etcd-vsphere/certs/client-key.pem",
+		CertFile:       "../tf-etcd-vsphere/certs/client.pem",
+		TrustedCAFile:  "../tf-etcd-vsphere/certs/ca.pem",
 		ClientCertAuth: true,
 	}
 )
