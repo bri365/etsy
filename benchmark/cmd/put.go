@@ -72,10 +72,23 @@ func init() {
 }
 
 func putFunc(cmd *cobra.Command, args []string) {
+	if keySize < 8 {
+		fmt.Fprintf(os.Stderr, "expected --key-size of 8 or more, got (%v)", keySize)
+		os.Exit(1)
+	}
+
 	if keySpaceSize <= 0 {
 		fmt.Fprintf(os.Stderr, "expected positive --key-space-size, got (%v)", keySpaceSize)
 		os.Exit(1)
 	}
+
+	// Save keys to a file for use in other tests
+	name := fmt.Sprintf("keys/keys-%d-%d-%d", time.Now().Unix(), keySize, keySpaceSize)
+	f, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
 
 	var key []byte
 	var keys [][]byte
@@ -83,12 +96,18 @@ func putFunc(cmd *cobra.Command, args []string) {
 		data := make([]byte, keySize)
 		rand.Read(data)
 		keys = append(keys, data)
+		bytesWritten, err := f.Write(data)
+		if err != nil || bytesWritten != keySize {
+			panic(err)
+		}
 	}
 
 	if seqKeys {
+		// sequential keys start at zero for now
 		keys[0] = make([]byte, keySize)
 	} else {
 		k := keys[0]
+		// zero out the final uint64 bytes
 		binary.LittleEndian.PutUint64(k[keySize-8:keySize], 0)
 	}
 	// fmt.Printf("%v\n", keys[0])
