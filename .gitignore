@@ -4,6 +4,7 @@ terraform.tfstate*
 
 # binaries
 *.gz
+protoc*
 
 # certificates
 *.csr
