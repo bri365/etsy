@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"go.etcd.io/etcd/pkg/fileutil"
-	"go.etcd.io/etcd/pkg/tlsutil"
+	"example.com/etcd/pkg/fileutil"
+	"example.com/etcd/pkg/tlsutil"
 
 	"go.uber.org/zap"
 )

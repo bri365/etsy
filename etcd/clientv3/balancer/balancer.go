@@ -16,6 +16,8 @@
 package balancer
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -49,6 +51,9 @@ type Config struct {
 	// Logger configures balancer logging.
 	// If nil, logs are discarded.
 	Logger *zap.Logger
+
+	// HealthCheck indicates whether health checking should be enabled for this specific balancer.
+	HealthCheck bool
 }
 
 // RegisterBuilder creates and registers a builder. Since this function calls balancer.Register, it
@@ -70,17 +75,17 @@ type builder struct {
 
 // Build is called initially when creating "ccBalancerWrapper".
 // "grpc.Dial" is called to this client connection.
-// Then, resolved addresses will be handled via "HandleResolvedAddrs".
+// Then, resolved addresses will be handled via "UpdateClientConnState".
 func (b *builder) Build(cc balancer.ClientConn, opt balancer.BuildOptions) balancer.Balancer {
 	bb := &baseBalancer{
-		id:     strconv.FormatInt(time.Now().UnixNano(), 36),
-		policy: b.cfg.Policy,
-		name:   b.cfg.Name,
-		lg:     b.cfg.Logger,
+		id:                 strconv.FormatInt(time.Now().UnixNano(), 36),
+		policy:             b.cfg.Policy,
+		name:               b.cfg.Name,
+		lg:                 b.cfg.Logger,
+		healthCheckEnabled: b.cfg.HealthCheck,
 
-		addrToSc: make(map[resolver.Address]balancer.SubConn),
-		scToAddr: make(map[balancer.SubConn]resolver.Address),
-		scToSt:   make(map[balancer.SubConn]grpcconnectivity.State),
+		subConns: make(map[resolver.Address]balancer.SubConn),
+		scStates: make(map[balancer.SubConn]grpcconnectivity.State),
 
 		currentConn:          nil,
 		connectivityRecorder: connectivity.New(b.cfg.Logger),
@@ -108,12 +113,14 @@ func (b *builder) Name() string { return b.cfg.Name }
 
 // Balancer defines client balancer interface.
 type Balancer interface {
-	// Balancer is called on specified client connection. Client initiates gRPC
-	// connection with "grpc.Dial(addr, grpc.WithBalancerName)", and then those resolved
-	// addresses are passed to "grpc/balancer.Balancer.HandleResolvedAddrs".
-	// For each resolved address, balancer calls "balancer.ClientConn.NewSubConn".
-	// "grpc/balancer.Balancer.HandleSubConnStateChange" is called when connectivity state
-	// changes, thus requires failover logic in this method.
+	// Balancer takes input from gRPC, manages SubConns, and collects and aggregates
+	// the connectivity states.
+	//
+	// It also generates and updates the Picker used by gRPC to pick SubConns for RPCs.
+	//
+	// UpdateClientConnState, ResolverError, UpdateSubConnState, and Close are
+	// guaranteed to be called synchronously from the same goroutine.  There's no
+	// guarantee on picker.Pick, it may be called anytime.
 	balancer.Balancer
 
 	// Picker calls "Pick" for every client request.
@@ -121,93 +128,174 @@ type Balancer interface {
 }
 
 type baseBalancer struct {
-	id     string
-	policy picker.Policy
-	name   string
-	lg     *zap.Logger
+	id                 string
+	policy             picker.Policy
+	name               string
+	lg                 *zap.Logger
+	healthCheckEnabled bool
 
 	mu sync.RWMutex
 
-	addrToSc map[resolver.Address]balancer.SubConn
-	scToAddr map[balancer.SubConn]resolver.Address
-	scToSt   map[balancer.SubConn]grpcconnectivity.State
+	subConns map[resolver.Address]balancer.SubConn
+	scStates map[balancer.SubConn]grpcconnectivity.State
 
 	currentConn          balancer.ClientConn
 	connectivityRecorder connectivity.Recorder
 
 	picker picker.Picker
+
+	resolverErr error // the last error reported by the resolver; cleared on successful resolution
+	connErr     error // the last connection error; cleared upon leaving TransientFailure
 }
 
-// HandleResolvedAddrs implements "grpc/balancer.Balancer" interface.
-// gRPC sends initial or updated resolved addresses from "Build".
-func (bb *baseBalancer) HandleResolvedAddrs(addrs []resolver.Address, err error) {
-	if err != nil {
-		bb.lg.Warn("HandleResolvedAddrs called with error", zap.String("balancer-id", bb.id), zap.Error(err))
+// ResolverError implements "grpc/balancer.Balancer" interface.
+func (bb *baseBalancer) ResolverError(err error) {
+	bb.resolverErr = err
+	if len(bb.subConns) == 0 {
+		// Set current state to TransientFailure
+		bb.connectivityRecorder.RecordTransition(grpcconnectivity.TransientFailure, grpcconnectivity.TransientFailure)
+	}
+
+	if bb.connectivityRecorder.GetCurrentState() != grpcconnectivity.TransientFailure {
+		// The picker will not change since the balancer does not currently
+		// report an error.
 		return
 	}
-	bb.lg.Info("resolved",
+	bb.regeneratePicker()
+	bb.currentConn.UpdateState(balancer.State{
+		ConnectivityState: bb.connectivityRecorder.GetCurrentState(),
+		Picker:            bb.picker,
+	})
+}
+
+// UpdateClientConnState implements "grpc/balancer.Balancer" interface.
+// gRPC sends initial or updated resolved addresses from "Build".
+func (bb *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
+	bb.lg.Info("new ClientConn state",
 		zap.String("picker", bb.picker.String()),
 		zap.String("balancer-id", bb.id),
-		zap.Strings("addresses", addrsToStrings(addrs)),
 	)
 
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 
-	resolved := make(map[resolver.Address]struct{})
-	for _, addr := range addrs {
-		resolved[addr] = struct{}{}
-		if _, ok := bb.addrToSc[addr]; !ok {
-			sc, err := bb.currentConn.NewSubConn([]resolver.Address{addr}, balancer.NewSubConnOptions{})
+	// Successful resolution; clear resolver error and ensure we return nil.
+	bb.resolverErr = nil
+	// addrsSet is the set converted from addrs, it's used for quick lookup of an address.
+	addrsSet := make(map[resolver.Address]struct{})
+	for _, a := range s.ResolverState.Addresses {
+		addrsSet[a] = struct{}{}
+		if _, ok := bb.subConns[a]; !ok {
+			// a is a new address (not existing in b.subConns).
+			sc, err := bb.currentConn.NewSubConn([]resolver.Address{a}, balancer.NewSubConnOptions{HealthCheckEnabled: bb.healthCheckEnabled})
 			if err != nil {
-				bb.lg.Warn("NewSubConn failed", zap.String("picker", bb.picker.String()), zap.String("balancer-id", bb.id), zap.Error(err), zap.String("address", addr.Addr))
+				bb.lg.Warn("NewSubConn failed", zap.String("picker", bb.picker.String()), zap.String("balancer-id", bb.id), zap.Error(err), zap.String("address", a.Addr))
 				continue
 			}
-			bb.lg.Info("created subconn", zap.String("address", addr.Addr))
-			bb.addrToSc[addr] = sc
-			bb.scToAddr[sc] = addr
-			bb.scToSt[sc] = grpcconnectivity.Idle
+			bb.lg.Info("created subconn", zap.String("address", a.Addr))
+			bb.subConns[a] = sc
+			bb.scStates[sc] = grpcconnectivity.Idle
 			sc.Connect()
 		}
 	}
 
-	for addr, sc := range bb.addrToSc {
-		if _, ok := resolved[addr]; !ok {
-			// was removed by resolver or failed to create subconn
+	for a, sc := range bb.subConns {
+		// a was removed by resolver.
+		if _, ok := addrsSet[a]; !ok {
 			bb.currentConn.RemoveSubConn(sc)
-			delete(bb.addrToSc, addr)
-
-			bb.lg.Info(
-				"removed subconn",
-				zap.String("picker", bb.picker.String()),
-				zap.String("balancer-id", bb.id),
-				zap.String("address", addr.Addr),
-				zap.String("subconn", scToString(sc)),
-			)
-
-			// Keep the state of this sc in bb.scToSt until sc's state becomes Shutdown.
-			// The entry will be deleted in HandleSubConnStateChange.
-			// (DO NOT) delete(bb.scToAddr, sc)
-			// (DO NOT) delete(bb.scToSt, sc)
+			delete(bb.subConns, a)
+			// Keep the state of this sc in b.scStates until sc's state becomes Shutdown.
+			// The entry will be deleted in UpdateSubConnState.
+			// (DO NOT) delete(bb.scStates, sc)
 		}
 	}
+
+	// If resolver state contains no addresses, return an error so ClientConn
+	// will trigger re-resolve. Also records this as an resolver error, so when
+	// the overall state turns transient failure, the error message will have
+	// the zero address information.
+	if len(s.ResolverState.Addresses) == 0 {
+		bb.ResolverError(errors.New("produced zero addresses"))
+		return balancer.ErrBadResolverState
+	}
+	return nil
 }
 
-// HandleSubConnStateChange implements "grpc/balancer.Balancer" interface.
-func (bb *baseBalancer) HandleSubConnStateChange(sc balancer.SubConn, s grpcconnectivity.State) {
+// mergeErrors builds an error from the last connection error and the last
+// resolver error.  Must only be called if bb.connectivityRecorder.GetCurrentState() is TransientFailure.
+func (bb *baseBalancer) mergeErrors() error {
+	// connErr must always be non-nil unless there are no SubConns, in which
+	// case resolverErr must be non-nil.
+	if bb.connErr == nil {
+		return fmt.Errorf("last resolver error: %v", bb.resolverErr)
+	}
+	if bb.resolverErr == nil {
+		return fmt.Errorf("last connection error: %v", bb.connErr)
+	}
+	return fmt.Errorf("last connection error: %v; last resolver error: %v", bb.connErr, bb.resolverErr)
+}
+
+// regeneratePicker takes a snapshot of the balancer, and generates a picker
+// from it. The picker is
+//  - picker.NewErr picker if the balancer is in TransientFailure,
+//  - built by the picker.New with all READY SubConns otherwise.
+func (bb *baseBalancer) regeneratePicker() {
+	if bb.connectivityRecorder.GetCurrentState() == grpcconnectivity.TransientFailure {
+		bb.picker = picker.NewErr(bb.mergeErrors())
+		bb.lg.Info(
+			"updated picker to transient error picker",
+			zap.String("picker", bb.picker.String()),
+			zap.String("balancer-id", bb.id),
+			zap.String("policy", bb.policy.String()),
+		)
+		return
+	}
+	readySCs := make(map[balancer.SubConn]resolver.Address)
+
+	// Filter out all ready SCs from full subConn map.
+	for addr, sc := range bb.subConns {
+		if st, ok := bb.scStates[sc]; ok && st == grpcconnectivity.Ready {
+			readySCs[sc] = addr
+		}
+	}
+	bb.picker = picker.New(picker.Config{
+		Policy:                   bb.policy,
+		Logger:                   bb.lg,
+		SubConnToResolverAddress: readySCs,
+	})
+
+	bb.lg.Info(
+		"updated picker",
+		zap.String("picker", bb.picker.String()),
+		zap.String("balancer-id", bb.id),
+		zap.String("policy", bb.policy.String()),
+		zap.Strings("subconn-ready", scsToStrings(readySCs)),
+		zap.Int("subconn-size", len(readySCs)),
+	)
+}
+
+// UpdateSubConnState implements "grpc/balancer.Balancer" interface.
+func (bb *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.SubConnState) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
 
-	old, ok := bb.scToSt[sc]
+	s := state.ConnectivityState
+
+	old, ok := bb.scStates[sc]
 	if !ok {
 		bb.lg.Warn(
 			"state change for an unknown subconn",
 			zap.String("picker", bb.picker.String()),
 			zap.String("balancer-id", bb.id),
 			zap.String("subconn", scToString(sc)),
-			zap.Int("subconn-size", len(bb.scToAddr)),
 			zap.String("state", s.String()),
 		)
+		return
+	}
+	if old == grpcconnectivity.TransientFailure && s == grpcconnectivity.Connecting {
+		// Once a subconn enters TRANSIENT_FAILURE, ignore subsequent
+		// CONNECTING transitions to prevent the aggregated state from being
+		// always CONNECTING when many backends exist but are all down.
 		return
 	}
 
@@ -217,72 +305,35 @@ func (bb *baseBalancer) HandleSubConnStateChange(sc balancer.SubConn, s grpcconn
 		zap.String("balancer-id", bb.id),
 		zap.Bool("connected", s == grpcconnectivity.Ready),
 		zap.String("subconn", scToString(sc)),
-		zap.Int("subconn-size", len(bb.scToAddr)),
-		zap.String("address", bb.scToAddr[sc].Addr),
 		zap.String("old-state", old.String()),
 		zap.String("new-state", s.String()),
 	)
 
-	bb.scToSt[sc] = s
+	bb.scStates[sc] = s
 	switch s {
 	case grpcconnectivity.Idle:
 		sc.Connect()
 	case grpcconnectivity.Shutdown:
 		// When an address was removed by resolver, b called RemoveSubConn but
-		// kept the sc's state in scToSt. Remove state for this sc here.
-		delete(bb.scToAddr, sc)
-		delete(bb.scToSt, sc)
+		// kept the sc's state in scStates. Remove state for this sc here.
+		delete(bb.scStates, sc)
+	case grpcconnectivity.TransientFailure:
+		// Save error to be reported via picker.
+		bb.connErr = state.ConnectionError
 	}
 
-	oldAggrState := bb.connectivityRecorder.GetCurrentState()
 	bb.connectivityRecorder.RecordTransition(old, s)
 
-	// Update balancer picker when one of the following happens:
-	//  - this sc became ready from not-ready
-	//  - this sc became not-ready from ready
-	//  - the aggregated state of balancer became TransientFailure from non-TransientFailure
-	//  - the aggregated state of balancer became non-TransientFailure from TransientFailure
+	// Regenerate balancer picker when one of the following happens:
+	//  - this sc entered or left ready
+	//  - the aggregated state of balancer is TransientFailure
+	//    (may need to update error message)
 	if (s == grpcconnectivity.Ready) != (old == grpcconnectivity.Ready) ||
-		(bb.connectivityRecorder.GetCurrentState() == grpcconnectivity.TransientFailure) != (oldAggrState == grpcconnectivity.TransientFailure) {
-		bb.updatePicker()
+		bb.connectivityRecorder.GetCurrentState() == grpcconnectivity.TransientFailure {
+		bb.regeneratePicker()
 	}
 
-	bb.currentConn.UpdateBalancerState(bb.connectivityRecorder.GetCurrentState(), bb.picker)
-}
-
-func (bb *baseBalancer) updatePicker() {
-	if bb.connectivityRecorder.GetCurrentState() == grpcconnectivity.TransientFailure {
-		bb.picker = picker.NewErr(balancer.ErrTransientFailure)
-		bb.lg.Info(
-			"updated picker to transient error picker",
-			zap.String("picker", bb.picker.String()),
-			zap.String("balancer-id", bb.id),
-			zap.String("policy", bb.policy.String()),
-		)
-		return
-	}
-
-	// only pass ready subconns to picker
-	scToAddr := make(map[balancer.SubConn]resolver.Address)
-	for addr, sc := range bb.addrToSc {
-		if st, ok := bb.scToSt[sc]; ok && st == grpcconnectivity.Ready {
-			scToAddr[sc] = addr
-		}
-	}
-
-	bb.picker = picker.New(picker.Config{
-		Policy:                   bb.policy,
-		Logger:                   bb.lg,
-		SubConnToResolverAddress: scToAddr,
-	})
-	bb.lg.Info(
-		"updated picker",
-		zap.String("picker", bb.picker.String()),
-		zap.String("balancer-id", bb.id),
-		zap.String("policy", bb.policy.String()),
-		zap.Strings("subconn-ready", scsToStrings(scToAddr)),
-		zap.Int("subconn-size", len(scToAddr)),
-	)
+	bb.currentConn.UpdateState(balancer.State{ConnectivityState: bb.connectivityRecorder.GetCurrentState(), Picker: bb.picker})
 }
 
 // Close implements "grpc/balancer.Balancer" interface.
