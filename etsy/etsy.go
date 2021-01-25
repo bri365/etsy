@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/pkg/transport"
+	"github.com/roguesoftware/etcd/clientv3"
+	"github.com/roguesoftware/etcd/pkg/transport"
 	"google.golang.org/grpc/grpclog"
 )
 
